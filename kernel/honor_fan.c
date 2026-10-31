@@ -80,11 +80,6 @@ module_param(write_delay_ms, int, 0644);
 MODULE_PARM_DESC(write_delay_ms,
 	"Delay after each EC write, ms (default 150). Lower values desync the EC.");
 
-static int release_delay_ms = 1000;
-module_param(release_delay_ms, int, 0644);
-MODULE_PARM_DESC(release_delay_ms,
-	"Settle time after releasing to firmware before re-arming manual mode, ms (default 1000).");
-
 static int fsud_manual = 1;
 module_param(fsud_manual, int, 0644);
 MODULE_PARM_DESC(fsud_manual, "FSUD token that selects manual mode (default 1)");
@@ -218,18 +213,53 @@ static int fan_rpm(struct honor_fan *hf, int idx, long *val)
 }
 
 /*
+ * Write FSUD/FSVL through the firmware's own SFCS ACPI method.
+ *
+ * Direct WTER mailbox writes work for the first programming pass, but as
+ * soon as manual mode is active the EC silently ignores further writes
+ * (the registers keep their old values) and only recovers after minutes
+ * of idle.  Evaluating \SFCS -- which internally performs the very same
+ * WTER calls, but under the ACPI interpreter with the ECMT mutex -- works
+ * every time.  Prefer it and keep the raw path as a fallback for firmware
+ * versions that do not expose SFCS.
+ */
+static int ec_sfcs(struct honor_fan *hf, u8 fsud, u8 fsvl)
+{
+	struct acpi_object_list args;
+	union acpi_object arg;
+	u8 buf[5] = { 0, 0, fsud, fsvl, 0 };
+
+	(void)hf;
+
+	arg.type = ACPI_TYPE_BUFFER;
+	arg.buffer.length = sizeof(buf);
+	arg.buffer.pointer = buf;
+	args.count = 1;
+	args.pointer = &arg;
+
+	if (ACPI_FAILURE(acpi_evaluate_object(NULL, "\\SFCS", &args, NULL)))
+		return -ENODEV;
+
+	return 0;
+}
+
+/*
  * One FSUD/FSVL programming pass.  Both registers are always written:
  * a stale FSVL leaves the EC latched with the fans stopped.
  */
 static int program_fan(struct honor_fan *hf, u8 fsud, u8 fsvl)
 {
-	int ret = ec_ext_write(hf, EXT_FSUD, fsud);
+	int ret = ec_sfcs(hf, fsud, fsvl);
 
-	if (ret)
-		return ret;
-	ret = ec_ext_write(hf, EXT_FSVL, fsvl);
-	if (ret)
-		return ret;
+	if (ret) {
+		/* Fallback for firmware without \SFCS. */
+		ret = ec_ext_write(hf, EXT_FSUD, fsud);
+		if (ret)
+			return ret;
+		ret = ec_ext_write(hf, EXT_FSVL, fsvl);
+		if (ret)
+			return ret;
+	}
 
 	hf->last_fsud = fsud;
 	hf->last_fsvl = fsvl;
@@ -239,7 +269,7 @@ static int program_fan(struct honor_fan *hf, u8 fsud, u8 fsvl)
 
 static int apply_pwm(struct honor_fan *hf)
 {
-	u8 fsud = 0, fsvl = 0, target;
+	u8 fsud = 0, fsvl = 0, rb_fsud, rb_fsvl;
 	int ret;
 
 	/*
@@ -260,31 +290,25 @@ static int apply_pwm(struct honor_fan *hf)
 	if (hf->programmed && hf->last_fsud == fsud && hf->last_fsvl == fsvl)
 		return 0;
 
-	/*
-	 * The EC will not accept a new FSVL while FSUD is already 1: the
-	 * write is swallowed and the fans stop.  Every change must go
-	 * through a release, and the release needs time to settle -- the
-	 * inter-write pacing alone is not enough.
-	 */
-	ret = program_fan(hf, 0, 0);
+	ret = program_fan(hf, fsud, fsvl);
 	if (ret)
 		return ret;
 
-	if (fsud) {
-		msleep(release_delay_ms);
-		ret = program_fan(hf, fsud, fsvl);
-		if (ret)
-			return ret;
+	/*
+	 * Confirm the EC actually stored the values.  A direct mailbox write
+	 * that is silently dropped leaves FSUD/FSVL at their old values, so
+	 * reading them back is enough to detect the failure the old code
+	 * missed (the target register stayed non-zero the whole time).
+	 */
+	if (ec_ext_read(hf, EXT_FSUD, &rb_fsud) ||
+	    ec_ext_read(hf, EXT_FSVL, &rb_fsvl) ||
+	    rb_fsud != fsud || rb_fsvl != fsvl) {
+		pr_warn("EC ignored fan programming (wanted %u/%u, read back %u/%u)\n",
+			fsud, fsvl, rb_fsud, rb_fsvl);
+		hf->programmed = false;
+		return -EIO;
 	}
 
-	/* Confirm the EC took it; a zero target means it stopped listening. */
-	if (ec_ext_read(hf, EXT_FAN0_GEAR, &target) || target)
-		return 0;
-
-	pr_warn("EC ignored fan programming; releasing to firmware\n");
-	msleep(200);
-	hf->manual = false;
-	program_fan(hf, 0, 0);
 	return 0;
 }
 

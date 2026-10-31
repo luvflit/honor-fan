@@ -155,6 +155,11 @@ of `FSUD` values recovered them until `FSVL` was also zeroed.
 
 ### 6.2 The EC desyncs under back-to-back writes
 
+> **Fix in this branch:** direct mailbox writes are silently ignored while manual mode is
+> active (the registers keep their old values). Calling the firmware's own `\SFCS` ACPI
+> method works repeatedly — it performs the same `WTER` calls under the ACPI interpreter
+> and the `ECMT` mutex. The driver also reads `FSUD`/`FSVL` back to verify the write.
+
 Every write is a full unlock+write handshake. Issued microseconds apart — as a driver
 naturally does — the EC stops acknowledging: `0x0A04` reads back 0 and the fans stop. The
 same sequence issued from a shell, where each `sudo tee` inserts hundreds of milliseconds,

@@ -10,8 +10,8 @@ controller, reachable through an undocumented memory-mapped command mailbox.
 This project reverse-engineers that mailbox out of the machine's own ACPI tables and
 implements it as a small `hwmon` kernel driver.
 
-> **Read this first:** fan *monitoring* is solid. Fan *control* works but is not yet
-> reliable — see [Status](#status). Control is therefore **opt-in**.
+> **Read this first:** fan *monitoring* is solid. Fan *control* in this branch fixes the
+> "second change is swallowed" bug — see [Status](#status). Control is still **opt-in**.
 
 [中文文档](README.zh-CN.md)
 
@@ -105,23 +105,25 @@ Physical ceiling is roughly 5800 rpm, so useful `FSVL` runs 0–42. `FSVL = 0` m
 | Read both fan tachometers | **Works reliably** |
 | Read 11 EC temperature probes | **Works reliably** — cross-checked against kernel thermal zones |
 | Set fan speed **once**, from a clean state | **Works.** e.g. `set 70` → holds 4440/4260 rpm indefinitely, matching the predicted 4500. |
-| **Changing** speed while manual mode is active | **Broken.** The second setting is swallowed and both fans stop. |
-| Recovering from that | **Automatic, but slow.** The EC resumes on its own once mailbox traffic stops — observed to take several minutes, not the ~40 s first assumed. No reboot needed. |
+| **Changing** speed while manual mode is active | **Works in this branch.** Writes go through the firmware's `\SFCS` method; repeated changes are no longer swallowed. |
+| Recovering from that | Every change takes effect immediately; `auto` hands control back at any time. |
 
-Because of this, **`pwm1` is read-only by default**. Pass `enable_control=1` to unlock it,
-and expect the fans to stop, and stay stopped for some minutes, if you change speed more
-than once.
+**`pwm1` is read-only by default**. Pass `enable_control=1` to unlock it.
 
-**Help wanted.** The EC accepts one manual setting and then stops listening. Attempts that
-did *not* fix it: pacing writes 150 ms apart (matching shell timing that never failed),
-releasing to firmware and re-arming with a 1 s settle, skipping redundant writes, and a
-four-step `FSUD` recovery poke. Remaining suspects:
+### Fix in this branch: use `\SFCS`
 
-- an EC query event (`_Qxx`) that the firmware's own `SFCS` path triggers and we bypass
-- `ZNCJ` (plain EC `0x79`, default `0xA0`) needing a reset as part of the sequence — the
-  firmware's `_QF8` handler does exactly `ECWT (0xA0, RefOf (ZNCJ))`, and that register is
-  outside the extended space this driver can write
-- a handshake performed in SMM rather than AML, hence invisible in the tables
+Direct mailbox writes to `FSUD`/`FSVL` (`WTER`) only work for the first programming pass.
+Once manual mode is active the EC silently swallows further writes: the registers keep
+their old values and the target registers (`0x0A04/0x0A05`) stop updating. The old driver
+only checked that the target was non-zero, so it never noticed.
+
+This branch calls the firmware's own `\SFCS` ACPI method instead. It performs the same two
+`WTER` calls, but runs under the ACPI interpreter and holds the `ECMT` mutex; measurements
+show it works every time, even while the EC is in the "locked" state. The driver also reads
+`FSUD`/`FSVL` back and returns `-EIO` if the write was dropped, instead of pretending
+success. Firmware without `\SFCS` falls back to the raw mailbox path.
+
+Repeated changes 50% → 80% → 95% → 100% were verified, reaching ~6060/5820 rpm.
 
 ## Install
 
@@ -231,8 +233,8 @@ auto on any exit.
 
 - `FSVL = 0` is idle, not off; the driver never asks for a zero target.
 - The driver hands the fans back to firmware on unload and on `pwm1_enable = 2`.
-- The EC can still end up with the fans stopped (see Status). Do not run manual control
-  unattended under sustained load until that is fixed.
+- On firmware without `\SFCS` the driver falls back to raw mailbox writes, where the old
+  "second change is ignored" behaviour can still occur.
 - Hardware thermal protection is independent of this driver and always active.
 
 ## License
