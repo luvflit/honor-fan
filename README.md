@@ -107,6 +107,7 @@ Physical ceiling is roughly 5800 rpm, so useful `FSVL` runs 0–42. `FSVL = 0` m
 | Set fan speed **once**, from a clean state | **Works.** e.g. `set 70` → holds 4440/4260 rpm indefinitely, matching the predicted 4500. |
 | **Changing** speed while manual mode is active | **Works in this branch.** Writes go through the firmware's `\SFCS` method; repeated changes are no longer swallowed. |
 | Recovering from that | Every change takes effect immediately; `auto` hands control back at any time. |
+| EC reclaiming manual mode | **Handled.** The driver checks every 10 s and re-arms when the state is lost or the target is cleared. |
 
 **`pwm1` is read-only by default**. Pass `enable_control=1` to unlock it.
 
@@ -124,6 +125,12 @@ show it works every time, even while the EC is in the "locked" state. The driver
 success. Firmware without `\SFCS` falls back to the raw mailbox path.
 
 Repeated changes 50% → 80% → 95% → 100% were verified, reaching ~6060/5820 rpm.
+
+The EC can also **reclaim** manual mode on its own: `FSUD`, `FSVL` and the target registers
+are cleared to zero and the fans stop while the driver still thinks it owns them. A 10 s
+watchdog now re-reads the state and re-arms through `\SFCS`, logging
+`EC dropped manual state ... re-arming`. Adjust the interval with `watchdog_ms`; `0`
+disables it.
 
 ## Install
 
@@ -214,6 +221,7 @@ regardless of what this driver does.
 | `enable_control` | `0` | Allow writing fan speed. Off = monitoring only. |
 | `fsvl_max` | `42` | `FSVL` at `pwm1 = 255`; 42 ≈ 5800 rpm target. |
 | `fsud_manual` | `1` | Token written to `FSUD` to select manual mode. |
+| `watchdog_ms` | `10000` | Interval for checking and restoring manual state; `0` disables it. |
 | `force` | `0` | Skip the DMI model check (other models, at your own risk). |
 
 ## Reproducing the research

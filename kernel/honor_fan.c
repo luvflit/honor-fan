@@ -26,9 +26,11 @@
 #include <linux/dmi.h>
 #include <linux/hwmon.h>
 #include <linux/io.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
+#include <linux/workqueue.h>
 
 #define ECRAM_PHYS	0xFE0B0300UL
 #define ECRAM_LEN	0x100
@@ -84,11 +86,17 @@ static int fsud_manual = 1;
 module_param(fsud_manual, int, 0644);
 MODULE_PARM_DESC(fsud_manual, "FSUD token that selects manual mode (default 1)");
 
+static int watchdog_ms = 10000;
+module_param(watchdog_ms, int, 0644);
+MODULE_PARM_DESC(watchdog_ms,
+	"Re-arm manual mode if the EC drops it, ms (0 = disabled, default 10000)");
+
 struct honor_fan {
 	struct device *hwmon;
 	void __iomem *mb;
 	void __iomem *ecram;
 	struct mutex lock;	/* serialises mailbox transactions */
+	struct delayed_work watchdog;
 	u8 pwm;
 	bool manual;
 	u8 last_fsud, last_fsvl;	/* what the EC was last told */
@@ -267,6 +275,54 @@ static int program_fan(struct honor_fan *hf, u8 fsud, u8 fsvl)
 	return 0;
 }
 
+static int apply_pwm(struct honor_fan *hf);
+
+static void honor_fan_reschedule(struct honor_fan *hf)
+{
+	if (hf->manual && watchdog_ms > 0)
+		mod_delayed_work(system_wq, &hf->watchdog,
+				 msecs_to_jiffies(watchdog_ms));
+	else
+		cancel_delayed_work(&hf->watchdog);
+}
+
+/*
+ * The EC firmware reclaims manual mode on its own after a while: FSUD,
+ * FSVL and the target registers are cleared to zero and the fans stop,
+ * even though the driver still believes it owns them.  Poll the state
+ * and re-arm whenever it no longer matches what we programmed.
+ */
+static void honor_fan_watchdog(struct work_struct *work)
+{
+	struct honor_fan *hf = container_of(to_delayed_work(work),
+					    struct honor_fan, watchdog);
+	u8 want_fsvl, fsud = 0, fsvl = 0, gear = 0;
+	bool lost;
+
+	mutex_lock(&hf->lock);
+	if (!hf->manual)
+		goto out;
+
+	want_fsvl = DIV_ROUND_CLOSEST((int)hf->pwm * fsvl_max, 255);
+
+	if (ec_ext_read(hf, EXT_FSUD, &fsud) ||
+	    ec_ext_read(hf, EXT_FSVL, &fsvl) ||
+	    ec_ext_read(hf, EXT_FAN0_GEAR, &gear))
+		lost = true;
+	else
+		lost = fsud != fsud_manual || fsvl != want_fsvl || gear == 0;
+
+	if (lost) {
+		pr_warn_ratelimited("EC dropped manual state (FSUD=%u FSVL=%u gear=%u); re-arming\n",
+				    fsud, fsvl, gear);
+		hf->programmed = false;
+		apply_pwm(hf);
+	}
+out:
+	honor_fan_reschedule(hf);
+	mutex_unlock(&hf->lock);
+}
+
 static int apply_pwm(struct honor_fan *hf)
 {
 	u8 fsud = 0, fsvl = 0, rb_fsud, rb_fsvl;
@@ -281,6 +337,8 @@ static int apply_pwm(struct honor_fan *hf)
 		fsud = fsud_manual;
 		fsvl = DIV_ROUND_CLOSEST((int)hf->pwm * fsvl_max, 255);
 	}
+
+	honor_fan_reschedule(hf);
 
 	/*
 	 * Every EC transaction is a chance to desync it, so do nothing at
@@ -509,6 +567,7 @@ static int honor_fan_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	mutex_init(&hf->lock);
+	INIT_DELAYED_WORK(&hf->watchdog, honor_fan_watchdog);
 	hf->pwm = 255;
 	hf->manual = false;
 
@@ -534,6 +593,9 @@ static int honor_fan_probe(struct platform_device *pdev)
 static void honor_fan_remove(struct platform_device *pdev)
 {
 	struct honor_fan *hf = platform_get_drvdata(pdev);
+
+	/* Stop the watchdog before taking the lock it acquires. */
+	cancel_delayed_work_sync(&hf->watchdog);
 
 	/*
 	 * Only touch the EC if we actually took manual control.  Every write
